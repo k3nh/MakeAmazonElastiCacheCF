@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation template for Standard Redis deployments
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Cluster Name"
+        Parameters:
+          - RedisClusterName     
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - StarficientProxyVPC
+          - StarficientProxyAvailabilityZones
+          - StarficientProxySubnetList          
+      - Label:
+          default: "Cache Configuration"
+        Parameters:
+          - AuthenticationToken
+          - CacheNodeType
+          - Engine
+          - EngineVersion
+      - Label:
+          default: "Security Configuration"
+        Parameters:
+          - StarficientSecurityGroupId
+      - Label:
+          default: "Replication Configuration"
+        Parameters:
+          - NumberOfReplicas
+     
+Parameters:
+  RedisClusterName:
+    Type: String
+    Description: Name of the Starficient Redis cluster for Exporting the Output Endpoint for reuse.
+    Default: StarficientElastiCache
+  AuthenticationToken:
+    Description: >-
+      Optional, you may provide an authentication token for the Redis cluster. Use the following one-liner to generate a token:
+      echo "$(openssl rand -hex 16 | fold -w1 | awk 'BEGIN{srand()}{a[NR]=$0}END{a[int(1+rand()*16)]=toupper(a[int(1+rand()*16)]); for(i=1;i<=16;i++) printf "%s",a[i]; printf "\n"}')"
+    Type: String
+    Default: "$DefaultAuthenticationToken"
+
+  CacheNodeType:
+    Type: String
+    Default: "$DefaultCacheNodeType"
+    Description: >-
+      $CacheNodeTypeDescription
+    AllowedValues: $AllowedCacheNodeTypes
+
+  Engine:
+    Description: The name of the cache engine to be used for this cluster. We only support Redis.
+    Type: String
+    Default: "redis"
+
+  EngineVersion:
+    Description: The version number of the cache engine to be used for this cluster. 7.1 is performance optimized.
+    Type: String
+    Default: "7.1"
+    AllowedValues: ["7.0","7.1"]
+
+  StarficientProxyVPC:
+    Type: 'AWS::EC2::VPC::Id'
+    Description: VPC ID for Application Use, should generally match the database's VPC being used, unless in a multi-region configuration.
+
+  StarficientProxyAvailabilityZones:
+    Type: 'List<AWS::EC2::AvailabilityZone::Name>'
+    Description: Availability zones for NLB and proxy deployment. Choose the AZs you will deploy ElastiCache cluster nodes to.
+
+  StarficientProxySubnetList:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description:  Subnet IDs for Starficient resource deployment, including proxy and NLB deployment. The actual assignment of  IP's is selected below. It is not possible to look this up here, so check that your AZs have subnets and you are choosing them here.
+
+  StarficientSecurityGroupId:
+    Description: Select or paste the ID of an existing security group to attach to the Redis cluster. This should either be the ASG SG or the Manager SG if you do not have ASG.
+    Type: AWS::EC2::SecurityGroup::Id
+
+  NumberOfReplicas:
+    Description: The number of replicas per AZ create in the replication group. Default is from python config script.
+    Type: Number
+    Default: $NumberOfReplicas
+    MinValue: 0
+    MaxValue: 5
+
+Conditions:
+  OneReplica: !Equals [!Ref NumberOfReplicas, 1]
+  TwoReplicas: !Equals [!Ref NumberOfReplicas, 2]
+  IsDataTieringInstance: !Or 
+    - !Equals [ !Ref CacheNodeType, "cache.r6gd.16xlarge" ]
+    - !Equals [ !Ref CacheNodeType, "cache.r6gd.12xlarge" ]
+    - !Equals [ !Ref CacheNodeType, "cache.r6gd.8xlarge" ]
+    - !Equals [ !Ref CacheNodeType, "cache.r6gd.4xlarge" ]
+    - !Equals [ !Ref CacheNodeType, "cache.r6gd.2xlarge" ]
+    - !Equals [ !Ref CacheNodeType, "cache.r6gd.xlarge" ]
+  AuthenticationTokenProvided: !Not [!Equals [!Ref AuthenticationToken, ""]]
+
+Resources:
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group for Redis cluster
+      SubnetIds: !Ref StarficientProxySubnetList
+
+  CustomParameterGroup:
+    Type: 'AWS::ElastiCache::ParameterGroup'
+    Properties:
+      CacheParameterGroupFamily: redis7
+      Description: Custom Parameter Group for Starficient Data
+      Properties:
+        notify-keyspace-events: 'AE'
+
+  RedisReplicationGroup:
+    Type: 'AWS::ElastiCache::ReplicationGroup'
+    Properties:
+      ReplicationGroupId: !Ref RedisClusterName
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      NumCacheClusters: 
+        !If 
+          - OneReplica
+          - 2  # 1 primary + 1 replica
+          - !If 
+              - TwoReplicas
+              - 3  # 1 primary + 2 replicas
+              - 1  # else Default to only primary if no replicas are specified
+      ReplicationGroupDescription: "Redis replication group with failover"
+      AtRestEncryptionEnabled: !If [AuthenticationTokenProvided, true, false]
+      TransitEncryptionEnabled: !If [AuthenticationTokenProvided, true, false]
+      AuthToken: !If [AuthenticationTokenProvided, !Ref AuthenticationToken, !Ref "AWS::NoValue"]
+      Engine: !Ref Engine
+      EngineVersion: !Ref EngineVersion
+      CacheNodeType: !Ref CacheNodeType
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds: [!Ref StarficientSecurityGroupId]
+      CacheParameterGroupName: !Ref CustomParameterGroup
+      DataTieringEnabled: !If [IsDataTieringInstance, true, false]
+
+Outputs:
+  RedisClusterAuthenticationToken:
+    Description: 'Authentication token for the Redis cluster'
+    Value: !If
+      - AuthenticationTokenProvided
+      - !Ref AuthenticationToken
+      - 'N/A'
+  RedisClusterCacheNodeType:
+    Description: 'The EC2 instance type and memory capacity of the nodes in the ElastiCache Cluster'
+    Value: !Ref CacheNodeType
+  RedisClusterEngine:
+    Description: 'The name of the cache engine used for this cluster'
+    Value: !Ref Engine
+  RedisClusterEngineVersion:
+    Description: 'The version number of the cache engine used for this cluster'
+    Value: !Ref EngineVersion
+  RedisClusterPrimaryEndPointAddress:
+    Description: 'The DNS name of the primary Redis endpoint'
+    Value: !Select [0, !Split [":", !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address]]
+  RedisClusterName:
+    Description: 'The name of the Redis cluster'
+    Value: !Ref RedisClusterName  # Reference the RedisClusterName parameter here
+  PrimaryEndPointAddress:
+    Description: 'The DNS address of the primary read-write cache node.'
+    Value: !GetAtt 'RedisReplicationGroup.PrimaryEndPoint.Address'
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryEndPointAddress'
+
+
